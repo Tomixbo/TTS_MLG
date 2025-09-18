@@ -66,6 +66,8 @@ def replace_symbols(text, lang="en"):
     text = text.replace(":", ",")
     if lang == "en":
         text = text.replace("&", " and ")
+    elif lang == "mlg":
+        text = text.replace("&", " sy ")
     elif lang == "fr":
         text = text.replace("&", " et ")
     elif lang == "pt":
@@ -115,6 +117,15 @@ def english_cleaners(text):
     text = en_normalize_numbers(text)
     text = expand_abbreviations(text)
     text = replace_symbols(text)
+    text = remove_aux_symbols(text)
+    text = collapse_whitespace(text)
+    return text
+
+def malagasy_cleaners(text):
+    """Pipeline for Malagasy text, including number and abbreviation expansion."""
+    # text = convert_to_ascii(text)
+    text = lowercase(text)
+    text = replace_symbols(text, lang="mlg")
     text = remove_aux_symbols(text)
     text = collapse_whitespace(text)
     return text
