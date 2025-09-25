@@ -6,6 +6,7 @@ from typing import Dict, List, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import tqdm
 from torch.utils.data import Dataset
 
@@ -47,10 +48,25 @@ def string2filename(string):
 def get_audio_size(audiopath):
     extension = audiopath.rpartition(".")[-1].lower()
     if extension not in {"mp3", "wav", "flac"}:
-        raise RuntimeError(f"The audio format {extension} is not supported, please convert the audio files to mp3, flac, or wav format!")
+        raise RuntimeError(
+            f"The audio format {extension} is not supported, please convert the audio files to mp3, flac, or wav format!"
+        )
 
     audio_info = mutagen.File(audiopath).info
     return int(audio_info.length * audio_info.sample_rate)
+
+
+def safe_makedirs(path: str):
+    """Create directory once across DDP ranks and synchronize."""
+    if path is None:
+        return
+    is_ddp = dist.is_available() and dist.is_initialized()
+    if is_ddp:
+        if dist.get_rank() == 0:
+            os.makedirs(path, exist_ok=True)
+        dist.barrier()
+    else:
+        os.makedirs(path, exist_ok=True)
 
 
 class TTSDataset(Dataset):
@@ -86,58 +102,28 @@ class TTSDataset(Dataset):
 
         Args:
             outputs_per_step (int): Number of time frames predicted per step.
-
             compute_linear_spec (bool): compute linear spectrogram if True.
-
             ap (TTS.tts.utils.AudioProcessor): Audio processor object.
-
             samples (list): List of dataset samples.
-
-            tokenizer (TTSTokenizer): tokenizer to convert text to sequence IDs. If None init internally else
-                use the given. Defaults to None.
-
+            tokenizer (TTSTokenizer): tokenizer to convert text to sequence IDs. If None init internally else use the given. Defaults to None.
             compute_f0 (bool): compute f0 if True. Defaults to False.
-
             compute_energy (bool): compute energy if True. Defaults to False.
-
             f0_cache_path (str): Path to store f0 cache. Defaults to None.
-
             energy_cache_path (str): Path to store energy cache. Defaults to None.
-
             return_wav (bool): Return the waveform of the sample. Defaults to False.
-
-            batch_group_size (int): Range of batch randomization after sorting
-                sequences by length. It shuffles each batch with bucketing to gather similar lenght sequences in a
-                batch. Set 0 to disable. Defaults to 0.
-
-            min_text_len (int): Minimum length of input text to be used. All shorter samples will be ignored.
-                Defaults to 0.
-
-            max_text_len (int): Maximum length of input text to be used. All longer samples will be ignored.
-                Defaults to float("inf").
-
-            min_audio_len (int): Minimum length of input audio to be used. All shorter samples will be ignored.
-                Defaults to 0.
-
-            max_audio_len (int): Maximum length of input audio to be used. All longer samples will be ignored.
-                The maximum length in the dataset defines the VRAM used in the training. Hence, pay attention to
-                this value if you encounter an OOM error in training. Defaults to float("inf").
-
-            phoneme_cache_path (str): Path to cache computed phonemes. It writes phonemes of each sample to a
-                separate file. Defaults to None.
-
+            batch_group_size (int): Range of batch randomization after sorting sequences by length. Defaults to 0.
+            min_text_len (int): Minimum length of input text to be used. Defaults to 0.
+            max_text_len (int): Maximum length of input text to be used. Defaults to float("inf").
+            min_audio_len (int): Minimum length of input audio to be used. Defaults to 0.
+            max_audio_len (int): Maximum length of input audio to be used. Defaults to float("inf").
+            phoneme_cache_path (str): Path to cache computed phonemes. Defaults to None.
             precompute_num_workers (int): Number of workers to precompute features. Defaults to 0.
-
-            speaker_id_mapping (dict): Mapping of speaker names to IDs used to compute embedding vectors by the
-                embedding layer. Defaults to None.
-
+            speaker_id_mapping (dict): Mapping of speaker names to IDs. Defaults to None.
             d_vector_mapping (dict): Mapping of wav files to computed d-vectors. Defaults to None.
-
-            use_noise_augment (bool): Enable adding random noise to wav for augmentation. Defaults to False.
-
-            start_by_longest (bool): Start by longest sequence. It is especially useful to check OOM. Defaults to False.
-
-            verbose (bool): Print diagnostic information. Defaults to false.
+            language_id_mapping (dict): Mapping of language names to IDs. Defaults to None.
+            use_noise_augment (bool): Enable adding random noise to wav. Defaults to False.
+            start_by_longest (bool): Start by longest sequence. Defaults to False.
+            verbose (bool): Print diagnostic information. Defaults to False.
         """
         super().__init__()
         self.batch_group_size = batch_group_size
@@ -566,8 +552,7 @@ class TTSDataset(Dataset):
 
         raise TypeError(
             (
-                "batch must contain tensors, numbers, dicts or lists;\
-                         found {}".format(
+                "batch must contain tensors, numbers, dicts or lists;                         found {}".format(
                     type(batch[0])
                 )
             )
@@ -581,17 +566,10 @@ class PhonemeDataset(Dataset):
     loading latency. If `cache_path` is already present, it skips the pre-computation.
 
     Args:
-        samples (Union[List[List], List[Dict]]):
-            List of samples. Each sample is a list or a dict.
-
-        tokenizer (TTSTokenizer):
-            Tokenizer to convert input text to phonemes.
-
-        cache_path (str):
-            Path to cache phonemes. If `cache_path` is already present or None, it skips the pre-computation.
-
-        precompute_num_workers (int):
-            Number of workers used for pre-computing the phonemes. Defaults to 0.
+        samples (Union[List[List], List[Dict]]): List of samples. Each sample is a list or a dict.
+        tokenizer (TTSTokenizer): Tokenizer to convert input text to phonemes.
+        cache_path (str): Path to cache phonemes. If `cache_path` is already present or None, it skips the pre-computation.
+        precompute_num_workers (int): Number of workers used for pre-computing the phonemes. Defaults to 0.
     """
 
     def __init__(
@@ -605,7 +583,7 @@ class PhonemeDataset(Dataset):
         self.tokenizer = tokenizer
         self.cache_path = cache_path
         if cache_path is not None and not os.path.exists(cache_path):
-            os.makedirs(cache_path)
+            safe_makedirs(cache_path)
             self.precompute(precompute_num_workers)
 
     def __getitem__(self, index):
@@ -674,23 +652,6 @@ class F0Dataset:
 
     Pre-compute F0 values for all the samples at initialization if `cache_path` is not None or already present. It
     also computes the mean and std of F0 values if `normalize_f0` is True.
-
-    Args:
-        samples (Union[List[List], List[Dict]]):
-            List of samples. Each sample is a list or a dict.
-
-        ap (AudioProcessor):
-            AudioProcessor to compute F0 from wav files.
-
-        cache_path (str):
-            Path to cache F0 values. If `cache_path` is already present or None, it skips the pre-computation.
-            Defaults to None.
-
-        precompute_num_workers (int):
-            Number of workers used for pre-computing the F0 values. Defaults to 0.
-
-        normalize_f0 (bool):
-            Whether to normalize F0 values by mean and std. Defaults to True.
     """
 
     def __init__(
@@ -712,7 +673,7 @@ class F0Dataset:
         self.mean = None
         self.std = None
         if cache_path is not None and not os.path.exists(cache_path):
-            os.makedirs(cache_path)
+            safe_makedirs(cache_path)
             self.precompute(precompute_num_workers)
         if normalize_f0:
             self.load_stats(cache_path)
@@ -826,23 +787,6 @@ class EnergyDataset:
 
     Pre-compute Energy values for all the samples at initialization if `cache_path` is not None or already present. It
     also computes the mean and std of Energy values if `normalize_Energy` is True.
-
-    Args:
-        samples (Union[List[List], List[Dict]]):
-            List of samples. Each sample is a list or a dict.
-
-        ap (AudioProcessor):
-            AudioProcessor to compute Energy from wav files.
-
-        cache_path (str):
-            Path to cache Energy values. If `cache_path` is already present or None, it skips the pre-computation.
-            Defaults to None.
-
-        precompute_num_workers (int):
-            Number of workers used for pre-computing the Energy values. Defaults to 0.
-
-        normalize_Energy (bool):
-            Whether to normalize Energy values by mean and std. Defaults to True.
     """
 
     def __init__(
@@ -863,7 +807,7 @@ class EnergyDataset:
         self.mean = None
         self.std = None
         if cache_path is not None and not os.path.exists(cache_path):
-            os.makedirs(cache_path)
+            safe_makedirs(cache_path)
             self.precompute(precompute_num_workers)
         if normalize_energy:
             self.load_stats(cache_path)
