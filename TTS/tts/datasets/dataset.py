@@ -18,8 +18,7 @@ from TTS.utils.audio.numpy_transforms import compute_energy as calculate_energy
 
 import mutagen
 
-# to prevent too many open files error as suggested here
-# https://github.com/pytorch/pytorch/issues/11201#issuecomment-421146936
+# Eviter "too many open files"
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
@@ -29,8 +28,10 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 def _is_ddp():
     return dist.is_available() and dist.is_initialized()
 
+
 def _rank():
     return dist.get_rank() if _is_ddp() else 0
+
 
 def _barrier():
     if _is_ddp():
@@ -42,26 +43,24 @@ def _barrier():
 # -----------------------
 def _np_load_retry(path, retries=5, delay=0.1):
     """
-    Robust np.load without pickles. Retries on partial/corrupt reads while another
-    process writes the file atomically.
+    np.load robuste sans pickle. Retry si lecture partielle pendant une écriture atomique.
     """
-    for i in range(retries):
+    for _ in range(retries):
         try:
             return np.load(path, allow_pickle=False)
         except FileNotFoundError:
             return None
         except Exception:
-            # likely partial write; wait and retry
             time.sleep(delay)
-    # last try; if it still fails, treat as missing
     try:
         return np.load(path, allow_pickle=False)
     except Exception:
         return None
 
+
 def _np_save_atomic(path, arr):
     """
-    Atomic save: write to temp file then replace.
+    Ecriture atomique: fichier temporaire puis replace.
     """
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
@@ -70,8 +69,9 @@ def _np_save_atomic(path, arr):
         np.save(tmp_name, arr, allow_pickle=False)
     os.replace(tmp_name, path)
 
+
 def _safe_makedirs_once(path: str):
-    """Create directory once across DDP ranks and synchronize."""
+    """Créer un dossier une seule fois à travers les ranks et synchroniser."""
     if path is None:
         return
     if _is_ddp():
@@ -80,6 +80,16 @@ def _safe_makedirs_once(path: str):
         _barrier()
     else:
         os.makedirs(path, exist_ok=True)
+
+
+def _ensure_finite_np(x, name):
+    if not np.all(np.isfinite(x)):
+        raise RuntimeError(f"Non-finite in {name} (numpy)")
+
+
+def _ensure_finite_t(x: torch.Tensor, name):
+    if not torch.isfinite(x).all():
+        raise RuntimeError(f"Non-finite in {name} (torch)")
 
 
 def _parse_sample(item):
@@ -101,7 +111,7 @@ def noise_augment_audio(wav):
 
 
 def string2filename(string):
-    # generate a safe and reversible filename based on a string
+    # nom de fichier sûr et réversible
     filename = base64.urlsafe_b64encode(string.encode("utf-8")).decode("utf-8", "ignore")
     return filename
 
@@ -112,7 +122,6 @@ def get_audio_size(audiopath):
         raise RuntimeError(
             f"The audio format {extension} is not supported, please convert the audio files to mp3, flac, or wav format!"
         )
-
     audio_info = mutagen.File(audiopath).info
     return int(audio_info.length * audio_info.sample_rate)
 
@@ -167,8 +176,6 @@ class TTSDataset(Dataset):
         self.start_by_longest = start_by_longest
 
         self.verbose = verbose
-        self.rescue_item_idx = 1
-        self.pitch_computed = False
         self.tokenizer = tokenizer
 
         if self.tokenizer.use_phonemes:
@@ -225,8 +232,9 @@ class TTSDataset(Dataset):
         print(f"{indent}| > Number of instances : {len(self.samples)}")
 
     def load_wav(self, filename):
-        waveform = self.ap.load_wav(filename)
+        waveform = self.ap.load_wav(filename).astype(np.float32)
         assert waveform.size > 0
+        _ensure_finite_np(waveform, "waveform")
         return waveform
 
     def get_phonemes(self, idx, text):
@@ -249,57 +257,64 @@ class TTSDataset(Dataset):
 
     @staticmethod
     def get_attn_mask(attn_file):
-        return np.load(attn_file, allow_pickle=False)
+        attn = np.load(attn_file, allow_pickle=False)
+        _ensure_finite_np(attn, "attn")
+        return attn
 
     def get_token_ids(self, idx, text):
         if self.tokenizer.use_phonemes:
             token_ids = self.get_phonemes(idx, text)["token_ids"]
         else:
             token_ids = self.tokenizer.text_to_ids(text)
-        return np.array(token_ids, dtype=np.int32)
+        token_ids = np.array(token_ids, dtype=np.int32)
+        _ensure_finite_np(token_ids, "token_ids")
+        return token_ids
 
-    def load_data(self, idx):
-        item = self.samples[idx]
+    def load_data(self, start_idx):
+        # Remplace la récursion par une boucle bornée
+        tries = 0
+        idx = start_idx
+        n = len(self.samples)
+        while tries < n:
+            item = self.samples[idx]
 
-        raw_text = item["text"]
+            raw_text = item["text"]
+            wav = self.load_wav(item["audio_file"])
 
-        wav = np.asarray(self.load_wav(item["audio_file"]), dtype=np.float32)
+            if self.use_noise_augment:
+                wav = noise_augment_audio(wav)
+                _ensure_finite_np(wav, "wav_aug")
 
-        # apply noise for augmentation
-        if self.use_noise_augment:
-            wav = noise_augment_audio(wav)
+            token_ids = self.get_token_ids(idx, item["text"])
 
-        # get token ids
-        token_ids = self.get_token_ids(idx, item["text"])
+            attn = None
+            if "alignment_file" in item:
+                attn = self.get_attn_mask(item["alignment_file"])
 
-        # get pre-computed attention maps
-        attn = None
-        if "alignment_file" in item:
-            attn = self.get_attn_mask(item["alignment_file"])
+            if len(token_ids) > self.max_text_len or len(wav) < self.min_audio_len:
+                tries += 1
+                idx = (idx + 1) % n
+                continue
 
-        # after phonemization the text length may change
-        if len(token_ids) > self.max_text_len or len(wav) < self.min_audio_len:
-            self.rescue_item_idx += 1
-            return self.load_data(self.rescue_item_idx)
+            f0 = self.get_f0(idx)["f0"] if self.compute_f0 else None
+            energy = self.get_energy(idx)["energy"] if self.compute_energy else None
 
-        # get f0 and energy
-        f0 = self.get_f0(idx)["f0"] if self.compute_f0 else None
-        energy = self.get_energy(idx)["energy"] if self.compute_energy else None
+            sample = {
+                "raw_text": raw_text,
+                "token_ids": token_ids,
+                "wav": wav,
+                "pitch": f0,
+                "energy": energy,
+                "attn": attn,
+                "item_idx": item["audio_file"],
+                "speaker_name": item["speaker_name"],
+                "language_name": item["language"],
+                "wav_file_name": os.path.basename(item["audio_file"]),
+                "audio_unique_name": item["audio_unique_name"],
+            }
+            return sample
 
-        sample = {
-            "raw_text": raw_text,
-            "token_ids": token_ids,
-            "wav": wav,
-            "pitch": f0,
-            "energy": energy,
-            "attn": attn,
-            "item_idx": item["audio_file"],
-            "speaker_name": item["speaker_name"],
-            "language_name": item["language"],
-            "wav_file_name": os.path.basename(item["audio_file"]),
-            "audio_unique_name": item["audio_unique_name"],
-        }
-        return sample
+        raise RuntimeError(" [!] No valid sample found after scanning the dataset.")
 
     @staticmethod
     def _compute_lengths(samples):
@@ -352,7 +367,6 @@ class TTSDataset(Dataset):
     def preprocess_samples(self):
         samples = self._compute_lengths(self.samples)
 
-        # sort items based on the sequence length in ascending order
         text_lengths = [i["text_length"] for i in samples]
         audio_lengths = [i["audio_length"] for i in samples]
         text_ignore_idx, text_keep_idx = self.filter_by_length(text_lengths, self.min_text_len, self.max_text_len)
@@ -361,7 +375,6 @@ class TTSDataset(Dataset):
         ignore_idx = list(set(audio_ignore_idx) | set(text_ignore_idx))
 
         samples = self._select_samples_by_idx(keep_idx, samples)
-
         sorted_idxs = self.sort_by_length(samples)
 
         if self.start_by_longest:
@@ -400,9 +413,9 @@ class TTSDataset(Dataset):
         return batch, text_lengths, ids_sorted_decreasing
 
     def collate_fn(self, batch):
-        # Puts each data field into a tensor with outer dimension batch size
+        # Puts each data field into un tenseur avec dimension batch
         if isinstance(batch[0], collections.abc.Mapping):
-            token_ids_lengths = np.array([len(d["token_ids"]) for d in batch])
+            token_ids_lengths = np.array([len(d["token_ids"]) for d in batch], dtype=np.int64)
 
             # sort by text length
             batch, token_ids_lengths, ids_sorted_decreasing = self._sort_batch(batch, token_ids_lengths)
@@ -421,6 +434,8 @@ class TTSDataset(Dataset):
 
             # features
             mel = [self.ap.melspectrogram(w).astype("float32") for w in batch["wav"]]
+            for m in mel:
+                _ensure_finite_np(m, "mel")
             mel_lengths = [m.shape[1] for m in mel]
             mel_lengths_adjusted = [
                 m.shape[1] + (self.outputs_per_step - (m.shape[1] % self.outputs_per_step))
@@ -430,7 +445,7 @@ class TTSDataset(Dataset):
             ]
 
             # stop targets
-            stop_targets = [np.array([0.0] * (ml - 1) + [1.0]) for ml in mel_lengths]
+            stop_targets = [np.array([0.0] * (ml - 1) + [1.0], dtype=np.float32) for ml in mel_lengths]
             stop_targets = prepare_stop_target(stop_targets, self.outputs_per_step)
 
             token_ids = prepare_data(batch["token_ids"]).astype(np.int32)
@@ -444,6 +459,7 @@ class TTSDataset(Dataset):
 
             if d_vectors is not None:
                 d_vectors = torch.FloatTensor(d_vectors)
+                _ensure_finite_t(d_vectors, "d_vectors")
             if speaker_ids is not None:
                 speaker_ids = torch.LongTensor(speaker_ids)
             if language_ids is not None:
@@ -452,6 +468,8 @@ class TTSDataset(Dataset):
             linear = None
             if self.compute_linear_spec:
                 linear = [self.ap.spectrogram(w).astype("float32") for w in batch["wav"]]
+                for l in linear:
+                    _ensure_finite_np(l, "linear")
                 linear = prepare_tensor(linear, self.outputs_per_step).transpose(0, 2, 1)
                 assert mel.shape[1] == linear.shape[1]
                 linear = torch.FloatTensor(linear).contiguous()
@@ -461,25 +479,27 @@ class TTSDataset(Dataset):
                 wav_lengths = [w.shape[0] for w in batch["wav"]]
                 max_wav_len = max(mel_lengths_adjusted) * self.ap.hop_length
                 wav_lengths = torch.LongTensor(wav_lengths)
-                wav_padded = torch.zeros(len(batch["wav"]), 1, max_wav_len)
+                wav_padded = torch.zeros(len(batch["wav"]), 1, max_wav_len, dtype=torch.float32)
                 for i, w in enumerate(batch["wav"]):
                     mel_length = mel_lengths_adjusted[i]
                     w = np.pad(w, (0, self.ap.hop_length * self.outputs_per_step), mode="edge")
                     w = w[: mel_length * self.ap.hop_length]
-                    wav_padded[i, :, : w.shape[0]] = torch.from_numpy(w)
+                    wav_padded[i, :, : w.shape[0]] = torch.from_numpy(w.astype(np.float32))
                 wav_padded.transpose_(1, 2)
 
             if self.compute_f0:
-                pitch = prepare_data(batch["pitch"])
+                pitch = prepare_data(batch["pitch"]).astype(np.float32)
                 assert mel.shape[1] == pitch.shape[1], f"[!] {mel.shape} vs {pitch.shape}"
-                pitch = torch.FloatTensor(pitch)[:, None, :].contiguous()
+                pitch = torch.from_numpy(pitch)[:, None, :].contiguous().to(torch.float32)
+                _ensure_finite_t(pitch, "pitch_batch")
             else:
                 pitch = None
 
             if self.compute_energy:
-                energy = prepare_data(batch["energy"])
+                energy = prepare_data(batch["energy"]).astype(np.float32)
                 assert mel.shape[1] == energy.shape[1], f"[!] {mel.shape} vs {energy.shape}"
-                energy = torch.FloatTensor(energy)[:, None, :].contiguous()
+                energy = torch.from_numpy(energy)[:, None, :].contiguous().to(torch.float32)
+                _ensure_finite_t(energy, "energy_batch")
             else:
                 energy = None
 
@@ -491,9 +511,13 @@ class TTSDataset(Dataset):
                     pad1 = token_ids.shape[1] - attn.shape[0]
                     assert pad1 >= 0 and pad2 >= 0, f"[!] Negative padding - {pad1} and {pad2}"
                     attn = np.pad(attn, [[0, pad1], [0, pad2]])
+                    _ensure_finite_np(attn, "attn_padded")
                     attns[idx] = attn
                 attns = prepare_tensor(attns, self.outputs_per_step)
                 attns = torch.FloatTensor(attns).unsqueeze(1)
+                # Sanity check finale des dims
+                assert attns.shape[2] == token_ids.shape[1] and attns.shape[3] == mel.shape[1], \
+                    f"[!] attn shape mismatch {attns.shape} vs tokens {token_ids.shape} / mel {mel.shape}"
 
             return {
                 "token_id": token_ids,
@@ -515,7 +539,7 @@ class TTSDataset(Dataset):
                 "audio_unique_names": batch["audio_unique_name"],
             }
 
-        raise TypeError(("batch must contain tensors, numbers, dicts or lists;                         found {}".format(type(batch[0]))))
+        raise TypeError(("batch must contain tensors, numbers, dicts or lists; found {}".format(type(batch[0]))))
 
 
 class PhonemeDataset(Dataset):
@@ -524,7 +548,6 @@ class PhonemeDataset(Dataset):
       * rank 0 crée le dossier et peut pré-calculer
       * écriture atomique .npy
       * lecture robuste sans pickle, avec retries
-      * pas de barrier par sample
     """
     def __init__(
         self,
@@ -538,8 +561,8 @@ class PhonemeDataset(Dataset):
         self.cache_path = cache_path
 
         # créer dossier une fois
+        need_precompute = False
         if cache_path is not None:
-            need_precompute = False
             if _is_ddp():
                 if _rank() == 0 and not os.path.exists(cache_path):
                     os.makedirs(cache_path, exist_ok=True)
@@ -569,27 +592,30 @@ class PhonemeDataset(Dataset):
         file_ext = "_phoneme.npy"
         cache_path = os.path.join(self.cache_path, file_name + file_ext)
 
-        # 1) lecture robuste si présent
+        # lecture robuste si présent
         if os.path.exists(cache_path):
             ids = _np_load_retry(cache_path)
             if ids is not None:
+                ids = np.asarray(ids, dtype=np.int64)
+                _ensure_finite_np(ids, "phoneme_ids_cached")
                 return ids
 
-        # 2) calcul local
+        # calcul local
         ids = self.tokenizer.text_to_ids(text, language=language)
+        ids = np.asarray(ids, dtype=np.int64)
+        _ensure_finite_np(ids, "phoneme_ids_new")
 
-        # 3) seul rank 0 écrit (atomique). Les autres reviennent leur propre ids.
+        # seul rank 0 écrit (atomique)
         if _rank() == 0:
             try:
-                _np_save_atomic(cache_path, np.asarray(ids, dtype=np.int64))
+                _np_save_atomic(cache_path, ids)
             except Exception:
-                # dernière chance: retire fichier corrompu
                 try:
                     if os.path.exists(cache_path):
                         os.remove(cache_path)
                 except Exception:
                     pass
-        return np.asarray(ids, dtype=np.int64)
+        return ids
 
     def get_pad_id(self):
         return self.tokenizer.pad_id
@@ -645,8 +671,8 @@ class F0Dataset:
         self.mean = None
         self.std = None
 
+        need_precompute = False
         if cache_path is not None:
-            need_precompute = False
             if _is_ddp():
                 if _rank() == 0 and not os.path.exists(cache_path):
                     os.makedirs(cache_path, exist_ok=True)
@@ -688,12 +714,11 @@ class F0Dataset:
             computed_data = []
             for batch in dataloder:
                 f0 = batch["f0"]
-                computed_data.append(f for f in f0)
+                computed_data.extend(f0)  # corrige append de générateur
                 pbar.update(batch_size)
             self.normalize_f0 = normalize_f0
 
         if self.normalize_f0:
-            computed_data = [tensor for batch in computed_data for tensor in batch]  # flatten
             pitch_mean, pitch_std = self.compute_pitch_stats(computed_data)
             pitch_stats = {"mean": pitch_mean, "std": pitch_std}
             _np_save_atomic(os.path.join(self.cache_path, "pitch_stats.npy"), pitch_stats)
@@ -707,17 +732,19 @@ class F0Dataset:
 
     @staticmethod
     def _compute_and_save_pitch(ap, wav_file, pitch_file=None):
-        wav = ap.load_wav(wav_file)
-        pitch = ap.compute_f0(wav)
+        wav = ap.load_wav(wav_file).astype(np.float32)
+        _ensure_finite_np(wav, "f0_wav")
+        pitch = ap.compute_f0(wav).astype(np.float32)
+        _ensure_finite_np(pitch, "f0_values")
         if pitch_file:
-            _np_save_atomic(pitch_file, pitch.astype(np.float32))
+            _np_save_atomic(pitch_file, pitch)
         return pitch
 
     @staticmethod
     def compute_pitch_stats(pitch_vecs):
-        nonzeros = np.concatenate([v[np.where(v != 0.0)[0]] for v in pitch_vecs])
+        nonzeros = np.concatenate([v[np.where(v != 0.0)[0]] for v in pitch_vecs]) if len(pitch_vecs) > 0 else np.array([1.0], dtype=np.float32)
         mean, std = np.mean(nonzeros), np.std(nonzeros)
-        return mean, std
+        return np.float32(mean), np.float32(std if std > 1e-8 else 1.0)
 
     def load_stats(self, cache_path):
         stats_path = os.path.join(cache_path, "pitch_stats.npy")
@@ -726,31 +753,32 @@ class F0Dataset:
             return
         stats = stats.item()
         self.mean = np.float32(stats["mean"])
-        self.std = np.float32(stats["std"])
+        self.std = np.float32(stats["std"] if stats["std"] > 1e-8 else 1.0)
 
     def normalize(self, pitch):
         zero_idxs = np.where(pitch == 0.0)[0]
         pitch = pitch - self.mean
         pitch = pitch / self.std
         pitch[zero_idxs] = 0.0
-        return pitch
+        return pitch.astype(np.float32)
 
     def denormalize(self, pitch):
         zero_idxs = np.where(pitch == 0.0)[0]
-        pitch *= self.std
-        pitch += self.mean
+        pitch = pitch * self.std
+        pitch = pitch + self.mean
         pitch[zero_idxs] = 0.0
-        return pitch
+        return pitch.astype(np.float32)
 
     def compute_or_load(self, wav_file, audio_unique_name):
         pitch_file = self.create_pitch_file_path(audio_unique_name, self.cache_path)
         if os.path.exists(pitch_file):
             pitch = _np_load_retry(pitch_file)
             if pitch is not None:
-                return pitch.astype(np.float32)
+                pitch = pitch.astype(np.float32)
+                _ensure_finite_np(pitch, "f0_cached")
+                return pitch
 
         pitch = self._compute_and_save_pitch(self.ap, wav_file, pitch_file if _rank() == 0 else None)
-        # si non rank0, on calcule mais on n'écrit pas; retour direct
         return pitch.astype(np.float32)
 
     def collate_fn(self, batch):
@@ -758,9 +786,10 @@ class F0Dataset:
         f0s = [item["f0"] for item in batch]
         f0_lens = [len(item["f0"]) for item in batch]
         f0_lens_max = max(f0_lens)
-        f0s_torch = torch.LongTensor(len(f0s), f0_lens_max).fill_(self.get_pad_id())
+        # FloatTensor, pas LongTensor
+        f0s_torch = torch.full((len(f0s), f0_lens_max), fill_value=self.get_pad_id(), dtype=torch.float32)
         for i, f0_len in enumerate(f0_lens):
-            f0s_torch[i, :f0_len] = torch.LongTensor(f0s[i])
+            f0s_torch[i, :f0_len] = torch.from_numpy(f0s[i].astype(np.float32))
         return {"audio_unique_name": audio_unique_name, "f0": f0s_torch, "f0_lens": f0_lens}
 
     def print_logs(self, level: int = 0) -> None:
@@ -790,8 +819,8 @@ class EnergyDataset:
         self.mean = None
         self.std = None
 
+        need_precompute = False
         if cache_path is not None:
-            need_precompute = False
             if _is_ddp():
                 if _rank() == 0 and not os.path.exists(cache_path):
                     os.makedirs(cache_path, exist_ok=True)
@@ -822,7 +851,7 @@ class EnergyDataset:
         return len(self.samples)
 
     def precompute(self, num_workers=0):
-        print("[*] Pre-computing energys...")
+        print("[*] Pre-computing energys...]")
         with tqdm.tqdm(total=len(self)) as pbar:
             batch_size = 1
             normalize_energy = self.normalize_energy
@@ -833,12 +862,11 @@ class EnergyDataset:
             computed_data = []
             for batch in dataloder:
                 energy = batch["energy"]
-                computed_data.append(e for e in energy)
+                computed_data.extend(energy)  # corrige append de générateur
                 pbar.update(batch_size)
             self.normalize_energy = normalize_energy
 
         if self.normalize_energy:
-            computed_data = [tensor for batch in computed_data for tensor in batch]  # flatten
             energy_mean, energy_std = self.compute_energy_stats(computed_data)
             energy_stats = {"mean": energy_mean, "std": energy_std}
             _np_save_atomic(os.path.join(self.cache_path, "energy_stats.npy"), energy_stats)
@@ -848,23 +876,27 @@ class EnergyDataset:
 
     @staticmethod
     def create_energy_file_path(wav_or_name, cache_path):
-        # compat: accept either full wav path or unique name
+        # compat: accepte chemin complet ou nom unique
         base = os.path.splitext(os.path.basename(wav_or_name))[0]
         return os.path.join(cache_path, base + "_energy.npy")
 
     @staticmethod
     def _compute_and_save_energy(ap, wav_file, energy_file=None):
-        wav = ap.load_wav(wav_file)
-        energy = calculate_energy(wav, fft_size=ap.fft_size, hop_length=ap.hop_length, win_length=ap.win_length)
+        wav = ap.load_wav(wav_file).astype(np.float32)
+        _ensure_finite_np(wav, "energy_wav")
+        energy = calculate_energy(wav, fft_size=ap.fft_size, hop_length=ap.hop_length, win_length=ap.win_length).astype(
+            np.float32
+        )
+        _ensure_finite_np(energy, "energy_values")
         if energy_file:
-            _np_save_atomic(energy_file, energy.astype(np.float32))
+            _np_save_atomic(energy_file, energy)
         return energy
 
     @staticmethod
     def compute_energy_stats(energy_vecs):
-        nonzeros = np.concatenate([v[np.where(v != 0.0)[0]] for v in energy_vecs])
+        nonzeros = np.concatenate([v[np.where(v != 0.0)[0]] for v in energy_vecs]) if len(energy_vecs) > 0 else np.array([1.0], dtype=np.float32)
         mean, std = np.mean(nonzeros), np.std(nonzeros)
-        return mean, std
+        return np.float32(mean), np.float32(std if std > 1e-8 else 1.0)
 
     def load_stats(self, cache_path):
         stats_path = os.path.join(cache_path, "energy_stats.npy")
@@ -873,28 +905,30 @@ class EnergyDataset:
             return
         stats = stats.item()
         self.mean = np.float32(stats["mean"])
-        self.std = np.float32(stats["std"])
+        self.std = np.float32(stats["std"] if stats["std"] > 1e-8 else 1.0)
 
     def normalize(self, energy):
         zero_idxs = np.where(energy == 0.0)[0]
         energy = energy - self.mean
         energy = energy / self.std
         energy[zero_idxs] = 0.0
-        return energy
+        return energy.astype(np.float32)
 
     def denormalize(self, energy):
         zero_idxs = np.where(energy == 0.0)[0]
-        energy *= self.std
-        energy += self.mean
+        energy = energy * self.std
+        energy = energy + self.mean
         energy[zero_idxs] = 0.0
-        return energy
+        return energy.astype(np.float32)
 
     def compute_or_load(self, wav_file, audio_unique_name):
         energy_file = self.create_energy_file_path(audio_unique_name, self.cache_path)
         if os.path.exists(energy_file):
             energy = _np_load_retry(energy_file)
             if energy is not None:
-                return energy.astype(np.float32)
+                energy = energy.astype(np.float32)
+                _ensure_finite_np(energy, "energy_cached")
+                return energy
 
         energy = self._compute_and_save_energy(self.ap, wav_file, energy_file if _rank() == 0 else None)
         return energy.astype(np.float32)
@@ -904,9 +938,10 @@ class EnergyDataset:
         energys = [item["energy"] for item in batch]
         energy_lens = [len(item["energy"]) for item in batch]
         energy_lens_max = max(energy_lens)
-        energys_torch = torch.LongTensor(len(energys), energy_lens_max).fill_(self.get_pad_id())
+        # FloatTensor, pas LongTensor
+        energys_torch = torch.full((len(energys), energy_lens_max), fill_value=self.get_pad_id(), dtype=torch.float32)
         for i, energy_len in enumerate(energy_lens):
-            energys_torch[i, :energy_len] = torch.LongTensor(energys[i])
+            energys_torch[i, :energy_len] = torch.from_numpy(energys[i].astype(np.float32))
         return {"audio_unique_name": audio_unique_name, "energy": energys_torch, "energy_lens": energy_lens}
 
     def print_logs(self, level: int = 0) -> None:
