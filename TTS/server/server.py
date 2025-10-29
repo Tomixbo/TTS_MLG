@@ -57,6 +57,17 @@ def create_argparser():
     parser.add_argument("--use_cuda", type=convert_boolean, default=False, help="true to use CUDA.")
     parser.add_argument("--debug", type=convert_boolean, default=False, help="true to enable Flask debug mode.")
     parser.add_argument("--show_details", type=convert_boolean, default=False, help="Generate model detail page.")
+
+    # --- NEW: option serveur pour la vitesse/rythme par défaut (VITS) ---
+    # length_scale < 1.0 = plus rapide ; > 1.0 = plus lent
+    parser.add_argument(
+        "--length_scale_default",
+        type=float,
+        default=1.0,
+        help="Default VITS length_scale. Smaller=faster, larger=slower.",
+    )
+    # --------------------------------------------------------------------
+
     return parser
 
 
@@ -126,6 +137,52 @@ language_manager = getattr(synthesizer.tts_model, "language_manager", None)
 # TODO: set this from SpeakerManager
 use_gst = synthesizer.tts_config.get("use_gst", False)
 app = Flask(__name__)
+
+# --- NEW: helpers pour length_scale côté requête ---
+# On lit un éventuel paramètre de requête/entête et on applique sur le modèle VITS.
+# Acceptés: header "length-scale" ou "length_scale", champs GET/POST "length_scale".
+def _read_length_scale_from_request() -> Union[None, float]:
+    val = (
+        request.headers.get("length-scale")
+        or request.headers.get("length_scale")
+        or request.values.get("length_scale")
+    )
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except Exception:
+        return None  # on ignore silencieusement si non numérique
+
+
+def _apply_length_scale_temporarily(ls: Union[None, float]):
+    """
+    Applique length_scale sur tts_model si possible et renvoie un callback de reset.
+    - Si ls est None: on applique la valeur par défaut serveur.
+    - Si le modèle ne possède pas 'length_scale': on ne fait rien.
+    """
+    # valeur à appliquer pour cette synthèse
+    target = args.length_scale_default if ls is None else ls
+
+    if hasattr(synthesizer.tts_model, "length_scale"):
+        # sauvegarde pour reset après synthèse
+        old = synthesizer.tts_model.length_scale
+        synthesizer.tts_model.length_scale = target
+
+        def _reset():
+            try:
+                synthesizer.tts_model.length_scale = old
+            except Exception:
+                pass
+
+        return _reset
+    else:
+        # pas de support length_scale sur ce modèle
+        def _noop():
+            return None
+
+        return _noop
+# ---------------------------------------------------
 
 
 def style_wav_uri_to_dict(style_wav: str) -> Union[str, dict]:
@@ -197,10 +254,21 @@ def tts():
         style_wav = request.headers.get("style-wav") or request.values.get("style_wav", "")
         style_wav = style_wav_uri_to_dict(style_wav)
 
+        # --- NEW: lecture et application temporaire du length_scale ---
+        # Permet de contrôler la vitesse/rythme depuis la requête.
+        req_ls = _read_length_scale_from_request()
+        _reset_length_scale = _apply_length_scale_temporarily(req_ls)
+        # --------------------------------------------------------------
+
         print(f" > Model input: {text}")
         print(f" > Speaker Idx: {speaker_idx}")
         print(f" > Language Idx: {language_idx}")
-        wavs = synthesizer.tts(text, speaker_name=speaker_idx, language_name=language_idx, style_wav=style_wav)
+        try:
+            wavs = synthesizer.tts(text, speaker_name=speaker_idx, language_name=language_idx, style_wav=style_wav)
+        finally:
+            # --- NEW: on rétablit la valeur précédente après synthèse ---
+            _reset_length_scale()
+            # ------------------------------------------------------------
         out = io.BytesIO()
         synthesizer.save_wav(wavs, out)
     return send_file(out, mimetype="audio/wav")
@@ -241,10 +309,27 @@ def mary_tts_api_process():
             data = parse_qs(request.get_data(as_text=True))
             # NOTE: we ignore param. LOCALE and VOICE for now since we have only one active model
             text = data.get("INPUT_TEXT", [""])[0]
+            # --- NEW: support length_scale en POST MaryTTS (optionnel) ---
+            # Si un client envoie length_scale dans le form-url-encoded, on le lit ici.
+            ls_str = data.get("length_scale", [None])[0]
+            req_ls = float(ls_str) if ls_str not in (None, "") else None
         else:
             text = request.args.get("INPUT_TEXT", "")
+            # --- NEW: support length_scale en GET MaryTTS (optionnel) ---
+            req_ls = _read_length_scale_from_request()
+        # ---------------------------------------------------------------
+
+        # --- NEW: application temporaire du length_scale ---
+        _reset_length_scale = _apply_length_scale_temporarily(req_ls)
+        # ---------------------------------------------------
+
         print(f" > Model input: {text}")
-        wavs = synthesizer.tts(text)
+        try:
+            wavs = synthesizer.tts(text)
+        finally:
+            # --- NEW: reset après synthèse ---
+            _reset_length_scale()
+            # ---------------------------------
         out = io.BytesIO()
         synthesizer.save_wav(wavs, out)
     return send_file(out, mimetype="audio/wav")
