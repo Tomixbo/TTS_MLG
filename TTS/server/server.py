@@ -68,6 +68,24 @@ def create_argparser():
     )
     # --------------------------------------------------------------------
 
+    # --- NEW: options serveur pour le contrôle de la variabilité à l'inférence ---
+    # inference_noise_scale: variation prosodique globale au décodeur
+    # inference_noise_scale_dp: variation sur le duration predictor (rythme local)
+    # Par défaut None = ne pas forcer et laisser la valeur du modèle.
+    parser.add_argument(
+        "--inference_noise_scale_default",
+        type=float,
+        default=None,
+        help="Default inference_noise_scale. Higher=more variation. None keeps model default.",
+    )
+    parser.add_argument(
+        "--inference_noise_scale_dp_default",
+        type=float,
+        default=None,
+        help="Default inference_noise_scale_dp (duration predictor). Higher=more timing variation. None keeps model default.",
+    )
+    # ------------------------------------------------------------------------------
+
     return parser
 
 
@@ -184,6 +202,80 @@ def _apply_length_scale_temporarily(ls: Union[None, float]):
         return _noop
 # ---------------------------------------------------
 
+# --- NEW: helpers pour inference_noise_scale et inference_noise_scale_dp ---
+# Lecture depuis headers/params et application temporaire avec reset après inférence.
+def _read_float_from_request(*keys) -> Union[None, float]:
+    """
+    Lit la première clé disponible dans headers ou params et tente un float.
+    Retourne None si absente ou invalide.
+    """
+    for k in keys:
+        v = request.headers.get(k)
+        if v is None or v == "":
+            v = request.values.get(k)
+        if v not in (None, ""):
+            try:
+                return float(v)
+            except Exception:
+                return None
+    return None
+
+
+def _apply_inference_noise_scale_temporarily(val: Union[None, float]):
+    """
+    Applique inference_noise_scale pour cette requête.
+    - Si val est None: utilise --inference_noise_scale_default s'il est fourni, sinon ne force rien.
+    """
+    to_apply = val if val is not None else args.inference_noise_scale_default
+    if to_apply is None:
+        # rien à faire
+        def _noop():
+            return None
+        return _noop
+
+    if hasattr(synthesizer.tts_model, "inference_noise_scale"):
+        old = synthesizer.tts_model.inference_noise_scale
+        synthesizer.tts_model.inference_noise_scale = to_apply
+
+        def _reset():
+            try:
+                synthesizer.tts_model.inference_noise_scale = old
+            except Exception:
+                pass
+        return _reset
+    else:
+        def _noop():
+            return None
+        return _noop
+
+
+def _apply_inference_noise_scale_dp_temporarily(val: Union[None, float]):
+    """
+    Applique inference_noise_scale_dp pour cette requête.
+    - Si val est None: utilise --inference_noise_scale_dp_default s'il est fourni, sinon ne force rien.
+    """
+    to_apply = val if val is not None else args.inference_noise_scale_dp_default
+    if to_apply is None:
+        def _noop():
+            return None
+        return _noop
+
+    if hasattr(synthesizer.tts_model, "inference_noise_scale_dp"):
+        old = synthesizer.tts_model.inference_noise_scale_dp
+        synthesizer.tts_model.inference_noise_scale_dp = to_apply
+
+        def _reset():
+            try:
+                synthesizer.tts_model.inference_noise_scale_dp = old
+            except Exception:
+                pass
+        return _reset
+    else:
+        def _noop():
+            return None
+        return _noop
+# ---------------------------------------------------------------------------
+
 
 def style_wav_uri_to_dict(style_wav: str) -> Union[str, dict]:
     """Transform an uri style_wav, in either a string (path to wav file to be use for style transfer)
@@ -260,15 +352,27 @@ def tts():
         _reset_length_scale = _apply_length_scale_temporarily(req_ls)
         # --------------------------------------------------------------
 
+        # --- NEW: lecture et application des bruits d'inférence ---
+        # Headers/params acceptés:
+        #  - inference-noise-scale, inference_noise_scale
+        #  - inference-noise-scale-dp, inference_noise_scale_dp
+        req_ins = _read_float_from_request("inference-noise-scale", "inference_noise_scale")
+        req_ins_dp = _read_float_from_request("inference-noise-scale-dp", "inference_noise_scale_dp")
+        _reset_ins = _apply_inference_noise_scale_temporarily(req_ins)
+        _reset_ins_dp = _apply_inference_noise_scale_dp_temporarily(req_ins_dp)
+        # -----------------------------------------------------------
+
         print(f" > Model input: {text}")
         print(f" > Speaker Idx: {speaker_idx}")
         print(f" > Language Idx: {language_idx}")
         try:
             wavs = synthesizer.tts(text, speaker_name=speaker_idx, language_name=language_idx, style_wav=style_wav)
         finally:
-            # --- NEW: on rétablit la valeur précédente après synthèse ---
+            # --- NEW: on rétablit les valeurs précédentes après synthèse ---
             _reset_length_scale()
-            # ------------------------------------------------------------
+            _reset_ins()
+            _reset_ins_dp()
+            # ---------------------------------------------------------------
         out = io.BytesIO()
         synthesizer.save_wav(wavs, out)
     return send_file(out, mimetype="audio/wav")
@@ -313,14 +417,27 @@ def mary_tts_api_process():
             # Si un client envoie length_scale dans le form-url-encoded, on le lit ici.
             ls_str = data.get("length_scale", [None])[0]
             req_ls = float(ls_str) if ls_str not in (None, "") else None
+
+            # --- NEW: support des bruits d'inférence en POST MaryTTS ---
+            ins_str = data.get("inference_noise_scale", [None])[0]
+            ins_dp_str = data.get("inference_noise_scale_dp", [None])[0]
+            req_ins = float(ins_str) if ins_str not in (None, "") else None
+            req_ins_dp = float(ins_dp_str) if ins_dp_str not in (None, "") else None
+            # -----------------------------------------------------------
         else:
             text = request.args.get("INPUT_TEXT", "")
             # --- NEW: support length_scale en GET MaryTTS (optionnel) ---
             req_ls = _read_length_scale_from_request()
-        # ---------------------------------------------------------------
+            # --- NEW: support des bruits d'inférence en GET MaryTTS ---
+            req_ins = _read_float_from_request("inference-noise-scale", "inference_noise_scale")
+            req_ins_dp = _read_float_from_request("inference-noise-scale-dp", "inference_noise_scale_dp")
+            # ------------------------------------------------------------
 
         # --- NEW: application temporaire du length_scale ---
         _reset_length_scale = _apply_length_scale_temporarily(req_ls)
+        # --- NEW: application temporaire des bruits d'inférence ---
+        _reset_ins = _apply_inference_noise_scale_temporarily(req_ins)
+        _reset_ins_dp = _apply_inference_noise_scale_dp_temporarily(req_ins_dp)
         # ---------------------------------------------------
 
         print(f" > Model input: {text}")
@@ -329,6 +446,8 @@ def mary_tts_api_process():
         finally:
             # --- NEW: reset après synthèse ---
             _reset_length_scale()
+            _reset_ins()
+            _reset_ins_dp()
             # ---------------------------------
         out = io.BytesIO()
         synthesizer.save_wav(wavs, out)
